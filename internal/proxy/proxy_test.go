@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"crypto/x509"
+	_ "embed"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,16 +25,13 @@ func TestMain(m *testing.M) {
 
 		if r.URL.Path == "/whoami" {
 			jwtHeader := r.Header.Get("X-Sentinel-Token")
-			fmt.Println(jwtHeader)
 			if jwtHeader == "" {
 				_, _ = w.Write([]byte("no token"))
 				return
 			}
 
 			token, err := jwt.ParseWithClaims(jwtHeader, &noopResult{}, func(token *jwt.Token) (interface{}, error) {
-				// since we only use the one private key to sign the tokens,
-				// we also only use its public counter part to verify
-				return []byte("abc123"), nil
+				return testPublicKey, nil
 			})
 
 			if err != nil {
@@ -57,7 +57,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestProxy(t *testing.T) {
-	s := New[noopResult](":8080")
+	s := New[noopResult](":8080", testSigningKey)
 	s.AddRoute("/", fakeBackend.URL)
 
 	handler := httptest.NewServer(s)
@@ -72,7 +72,7 @@ func TestProxy(t *testing.T) {
 }
 
 func TestProxy_Auth(t *testing.T) {
-	s := New[noopResult](":8080", WithAuthenticator(NoopeAuthenticator{
+	s := New[noopResult](":8080", testSigningKey, WithAuthenticator(NoopeAuthenticator{
 		authenticated: true,
 		identifier:    "testuser",
 	}))
@@ -88,3 +88,13 @@ func TestProxy_Auth(t *testing.T) {
 	require.Nil(t, err)
 	require.Equal(t, "testuser", string(body))
 }
+
+//go:embed rsatest.key
+var rsaTestKey []byte
+var rsaTestBlock, _ = pem.Decode(rsaTestKey)
+var testSigningKey, _ = x509.ParsePKCS1PrivateKey(rsaTestBlock.Bytes)
+
+//go:embed rsatest.key.pub
+var rsaTestPubKey []byte
+var rsaTestPubBlock, _ = pem.Decode(rsaTestPubKey)
+var testPublicKey, _ = x509.ParsePKIXPublicKey(rsaTestPubBlock.Bytes)

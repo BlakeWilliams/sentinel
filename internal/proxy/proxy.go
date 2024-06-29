@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -37,14 +36,16 @@ func WithHTTPClient[T IdentifiableClaims](c *http.Client) ServerOpt[T] {
 type Server[T IdentifiableClaims] struct {
 	Addr          string
 	Routes        *radical.Node[Route]
+	signingKey    any
 	httpClient    *http.Client
 	authenticator Authenticator[T]
 }
 
-func New[T IdentifiableClaims](addr string, opts ...ServerOpt[T]) *Server[T] {
+func New[T IdentifiableClaims](addr string, signingKey any, opts ...ServerOpt[T]) *Server[T] {
 	s := &Server[T]{
 		Addr:       addr,
 		Routes:     radical.New[Route](),
+		signingKey: signingKey,
 		httpClient: http.DefaultClient,
 	}
 
@@ -70,7 +71,7 @@ func (s *Server[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.Split(r.URL.Path, "/")
 
 	// TODO run some pre-resolution middleware
-	identifier := clientIP(r)
+	// identifier := clientIP(r)
 	headersToAdd := make(map[string]string)
 
 	if s.authenticator != nil {
@@ -81,13 +82,12 @@ func (s *Server[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if isAuthed {
-			identifier = payload.IdentifierValue()
-			unsignedToken := jwt.NewWithClaims(jwt.SigningMethodHS256, payload)
-
-			signedToken, err := unsignedToken.SignedString([]byte("abc123"))
-			fmt.Println(signedToken)
+			// identifier = payload.IdentifierValue()
+			unsignedToken := jwt.NewWithClaims(jwt.SigningMethodRS256, payload)
+			signedToken, err := unsignedToken.SignedString(s.signingKey)
 			if err != nil {
 				// TODO, log instead of 500. This service should be resilient
+				// and continue even if the token signing fails.
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -95,8 +95,6 @@ func (s *Server[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			headersToAdd["X-Sentinel-Token"] = signedToken
 		}
 	}
-
-	fmt.Println(identifier) // todo use with rate limiting if defined
 
 	ok, route := s.Routes.Value(path)
 
