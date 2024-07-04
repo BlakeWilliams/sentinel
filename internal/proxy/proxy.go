@@ -75,16 +75,69 @@ func (s *Server[T]) ListenAndServe() error {
 	return http.ListenAndServe(s.Addr, s)
 }
 
-// CompileHandler compiles the handler for the server. This is typically done lazily
-// in the first request to the server but can be explicitly compiled with this method too.
-func (s *Server[T]) CompileHandler() {
+func (s *Server[T]) compileInnerHandler() http.Handler {
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.Split(r.URL.Path, "/")
 
-		// TODO run some pre-resolution middleware
-		// identifier := clientIP(r)
-		headersToAdd := make(map[string]string)
+		ok, route := s.Routes.Value(path)
 
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		// TODO remove irrelevant headers
+
+		req, err := http.NewRequest(r.Method, route.Backend+r.URL.Path, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if auth, ok := GetAuth[T](r.Context()); ok {
+			// Set the JWT token in the header for the service to utilize
+			unsignedToken := jwt.NewWithClaims(jwt.SigningMethodRS256, auth)
+			signedToken, err := unsignedToken.SignedString(s.signingKey)
+			if err != nil {
+				// TODO, log instead of 500. This service should be resilient
+				// and continue even if the token signing fails.
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			req.Header.Set("X-Sentinel-Token", signedToken)
+		}
+
+		res, err := s.httpClient.Do(req)
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		for k, values := range res.Header {
+			for _, v := range values {
+				w.Header().Add(k, v)
+			}
+		}
+
+		_, _ = io.Copy(w, res.Body)
+	})
+
+	for i := len(s.postAuthMiddleware) - 1; i >= 0; i-- {
+		existingHandler := handler
+		handler = s.postAuthMiddleware[i](existingHandler)
+	}
+
+	return handler
+}
+
+// CompileHandler compiles the handler for the server. This is typically done lazily
+// in the first request to the server but can be explicitly compiled with this method too.
+func (s *Server[T]) CompileHandler() {
+	innerHandler := s.compileInnerHandler()
+
+	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.authenticator != nil {
 			isAuthed, payload, err := s.authenticator.Authenticate(w, r)
 			if err != nil {
@@ -93,61 +146,11 @@ func (s *Server[T]) CompileHandler() {
 			}
 
 			if isAuthed {
-				// identifier = payload.IdentifierValue()
-				unsignedToken := jwt.NewWithClaims(jwt.SigningMethodRS256, payload)
-				signedToken, err := unsignedToken.SignedString(s.signingKey)
-				if err != nil {
-					// TODO, log instead of 500. This service should be resilient
-					// and continue even if the token signing fails.
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				headersToAdd["X-Sentinel-Token"] = signedToken
 				r = r.WithContext(context.WithValue(r.Context(), AuthContextKey{}, payload))
 			}
 		}
 
-		var innerHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ok, route := s.Routes.Value(path)
-
-			if !ok {
-				http.NotFound(w, r)
-				return
-			}
-
-			// TODO remove irrelevant headers
-
-			req, err := http.NewRequest(r.Method, route.Backend+r.URL.Path, r.Body)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			for k, v := range headersToAdd {
-				req.Header.Set(k, v)
-			}
-
-			res, err := s.httpClient.Do(req)
-
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			for k, values := range res.Header {
-				for _, v := range values {
-					w.Header().Add(k, v)
-				}
-			}
-
-			_, _ = io.Copy(w, res.Body)
-		})
-
-		for i := len(s.postAuthMiddleware) - 1; i >= 0; i-- {
-			existingHandler := innerHandler
-			innerHandler = s.postAuthMiddleware[i](existingHandler)
-		}
-
+		// this is where we call the inner handler
 		innerHandler.ServeHTTP(w, r)
 	})
 
