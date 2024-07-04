@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -74,7 +75,9 @@ func (s *Server[T]) ListenAndServe() error {
 	return http.ListenAndServe(s.Addr, s)
 }
 
-func (s *Server[T]) compileHandler() {
+// CompileHandler compiles the handler for the server. This is typically done lazily
+// in the first request to the server but can be explicitly compiled with this method too.
+func (s *Server[T]) CompileHandler() {
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.Split(r.URL.Path, "/")
 
@@ -101,41 +104,51 @@ func (s *Server[T]) compileHandler() {
 				}
 
 				headersToAdd["X-Sentinel-Token"] = signedToken
+				r = r.WithContext(context.WithValue(r.Context(), AuthContextKey{}, payload))
 			}
 		}
 
-		ok, route := s.Routes.Value(path)
+		var innerHandler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ok, route := s.Routes.Value(path)
 
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-
-		// TODO remove irrelevant headers
-
-		req, err := http.NewRequest(r.Method, route.Backend+r.URL.Path, r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		for k, v := range headersToAdd {
-			req.Header.Set(k, v)
-		}
-
-		res, err := s.httpClient.Do(req)
-
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		for k, values := range res.Header {
-			for _, v := range values {
-				w.Header().Add(k, v)
+			if !ok {
+				http.NotFound(w, r)
+				return
 			}
+
+			// TODO remove irrelevant headers
+
+			req, err := http.NewRequest(r.Method, route.Backend+r.URL.Path, r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			for k, v := range headersToAdd {
+				req.Header.Set(k, v)
+			}
+
+			res, err := s.httpClient.Do(req)
+
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			for k, values := range res.Header {
+				for _, v := range values {
+					w.Header().Add(k, v)
+				}
+			}
+
+			_, _ = io.Copy(w, res.Body)
+		})
+
+		for i := len(s.postAuthMiddleware) - 1; i >= 0; i-- {
+			existingHandler := innerHandler
+			innerHandler = s.postAuthMiddleware[i](existingHandler)
 		}
 
-		_, _ = io.Copy(w, res.Body)
+		innerHandler.ServeHTTP(w, r)
 	})
 
 	for i := len(s.preAuthMiddleware) - 1; i >= 0; i-- {
@@ -147,12 +160,20 @@ func (s *Server[T]) compileHandler() {
 }
 
 func (s *Server[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.once.Do(s.compileHandler)
+	s.once.Do(s.CompileHandler)
 	s.handler.ServeHTTP(w, r)
 }
 
+// PreAuth adds a middleware that is run before the request is authenticated via
+// the provided authenticator.
 func (s *Server[T]) PreAuth(m Middleware) {
 	s.preAuthMiddleware = append(s.preAuthMiddleware, m)
+}
+
+// PostAuth adds a middleware that is run after the request is authenticated via
+// the provided authenticator.
+func (s *Server[T]) PostAuth(m Middleware) {
+	s.postAuthMiddleware = append(s.postAuthMiddleware, m)
 }
 
 // clientIP returns the client IP address from the request
@@ -168,4 +189,15 @@ func clientIP(r *http.Request) string {
 	}
 
 	return r.RemoteAddr
+}
+
+type AuthContextKey struct{}
+
+func GetAuth[T IdentifiableClaims](ctx context.Context) (T, bool) {
+	if v, ok := ctx.Value(AuthContextKey{}).(T); ok {
+		return v, true
+	}
+
+	var tType T
+	return tType, false
 }

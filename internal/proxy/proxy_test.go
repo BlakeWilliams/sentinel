@@ -23,6 +23,7 @@ func TestMain(m *testing.M) {
 		}
 
 		if r.URL.Path == "/whoami" {
+
 			jwtHeader := r.Header.Get("X-Sentinel-Token")
 			if jwtHeader == "" {
 				_, _ = w.Write([]byte("no token"))
@@ -110,6 +111,67 @@ func TestProxy_PreAuthMiddleware(t *testing.T) {
 	body, err := io.ReadAll(res.Body)
 	require.Nil(t, err)
 	require.Equal(t, "rate limited", string(body))
+}
+
+func TestProxy_PostAuthMiddleware(t *testing.T) {
+	s := New[noopResult](":8080", testSigningKey, WithAuthenticator(NoopeAuthenticator{
+		authenticated: true,
+		identifier:    "testuser",
+	}))
+	s.AddRoute("*", fakeBackend.URL)
+	called := false
+	s.PostAuth(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			auth, ok := GetAuth[noopResult](r.Context())
+			require.True(t, ok)
+			require.NotNil(t, auth)
+			require.Equal(t, "testuser", auth.Identifier)
+			called = true
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	handler := httptest.NewServer(s)
+	defer handler.Close()
+
+	res, err := http.Get(handler.URL + "/whoami")
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	body, err := io.ReadAll(res.Body)
+	require.Nil(t, err)
+	require.Equal(t, "testuser", string(body))
+	require.True(t, called)
+}
+
+func TestProxy_PostAuthMiddleware_Unauthenticated(t *testing.T) {
+	s := New[noopResult](":8080", testSigningKey, WithAuthenticator(NoopeAuthenticator{
+		authenticated: false,
+	}))
+	s.AddRoute("*", fakeBackend.URL)
+	called := false
+	s.PostAuth(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			auth, ok := GetAuth[noopResult](r.Context())
+			require.False(t, ok)
+			require.Empty(t, auth)
+			called = true
+
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	handler := httptest.NewServer(s)
+	defer handler.Close()
+
+	res, err := http.Get(handler.URL + "/whoami")
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	body, err := io.ReadAll(res.Body)
+	require.Nil(t, err)
+	require.Equal(t, "no token", string(body))
+	require.True(t, called)
 }
 
 //go:embed rsatest.key
