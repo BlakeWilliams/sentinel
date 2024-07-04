@@ -1,4 +1,4 @@
-package proxy
+package sentinel
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/blakewilliams/sentinel/radical"
+	"github.com/blakewilliams/sentinel/internal/radical"
 	"github.com/golang-jwt/jwt/v5"
 )
 

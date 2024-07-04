@@ -1,4 +1,4 @@
-package proxy
+package sentinel
 
 import (
 	"net/http"

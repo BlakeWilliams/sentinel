@@ -1,4 +1,4 @@
-package proxy
+package sentinel
 
 import "github.com/golang-jwt/jwt/v5"
 
