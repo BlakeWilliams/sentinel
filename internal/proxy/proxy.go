@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/blakewilliams/sentinel/radical"
 	"github.com/golang-jwt/jwt/v5"
@@ -31,14 +32,20 @@ func WithHTTPClient[T IdentifiableClaims](c *http.Client) ServerOpt[T] {
 	}
 }
 
+type Middleware func(http.Handler) http.Handler
+
 // Server is a basic HTTP proxy server that matches routes based on regular expressions
 // and forwards requests to the appropriate backend.
 type Server[T IdentifiableClaims] struct {
-	Addr          string
-	Routes        *radical.Node[Route]
-	signingKey    any
-	httpClient    *http.Client
-	authenticator Authenticator[T]
+	Addr               string
+	Routes             *radical.Node[Route]
+	signingKey         any
+	httpClient         *http.Client
+	authenticator      Authenticator[T]
+	once               sync.Once
+	handler            http.Handler
+	preAuthMiddleware  []Middleware
+	postAuthMiddleware []Middleware
 }
 
 func New[T IdentifiableClaims](addr string, signingKey any, opts ...ServerOpt[T]) *Server[T] {
@@ -67,67 +74,85 @@ func (s *Server[T]) ListenAndServe() error {
 	return http.ListenAndServe(s.Addr, s)
 }
 
-func (s *Server[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := strings.Split(r.URL.Path, "/")
+func (s *Server[T]) compileHandler() {
+	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.Split(r.URL.Path, "/")
 
-	// TODO run some pre-resolution middleware
-	// identifier := clientIP(r)
-	headersToAdd := make(map[string]string)
+		// TODO run some pre-resolution middleware
+		// identifier := clientIP(r)
+		headersToAdd := make(map[string]string)
 
-	if s.authenticator != nil {
-		isAuthed, payload, err := s.authenticator.Authenticate(w, r)
+		if s.authenticator != nil {
+			isAuthed, payload, err := s.authenticator.Authenticate(w, r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			if isAuthed {
+				// identifier = payload.IdentifierValue()
+				unsignedToken := jwt.NewWithClaims(jwt.SigningMethodRS256, payload)
+				signedToken, err := unsignedToken.SignedString(s.signingKey)
+				if err != nil {
+					// TODO, log instead of 500. This service should be resilient
+					// and continue even if the token signing fails.
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				headersToAdd["X-Sentinel-Token"] = signedToken
+			}
+		}
+
+		ok, route := s.Routes.Value(path)
+
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		// TODO remove irrelevant headers
+
+		req, err := http.NewRequest(r.Method, route.Backend+r.URL.Path, r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for k, v := range headersToAdd {
+			req.Header.Set(k, v)
+		}
+
+		res, err := s.httpClient.Do(req)
+
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		if isAuthed {
-			// identifier = payload.IdentifierValue()
-			unsignedToken := jwt.NewWithClaims(jwt.SigningMethodRS256, payload)
-			signedToken, err := unsignedToken.SignedString(s.signingKey)
-			if err != nil {
-				// TODO, log instead of 500. This service should be resilient
-				// and continue even if the token signing fails.
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+		for k, values := range res.Header {
+			for _, v := range values {
+				w.Header().Add(k, v)
 			}
-
-			headersToAdd["X-Sentinel-Token"] = signedToken
 		}
+
+		_, _ = io.Copy(w, res.Body)
+	})
+
+	for i := len(s.preAuthMiddleware) - 1; i >= 0; i-- {
+		existingHandler := handler
+		handler = s.preAuthMiddleware[i](existingHandler)
 	}
 
-	ok, route := s.Routes.Value(path)
+	s.handler = handler
+}
 
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
+func (s *Server[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.once.Do(s.compileHandler)
+	s.handler.ServeHTTP(w, r)
+}
 
-	// TODO remove irrelevant headers
-
-	req, err := http.NewRequest(r.Method, route.Backend+r.URL.Path, r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	for k, v := range headersToAdd {
-		req.Header.Set(k, v)
-	}
-
-	res, err := s.httpClient.Do(req)
-
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	for k, values := range res.Header {
-		for _, v := range values {
-			w.Header().Add(k, v)
-		}
-	}
-
-	io.Copy(w, res.Body)
+func (s *Server[T]) PreAuth(m Middleware) {
+	s.preAuthMiddleware = append(s.preAuthMiddleware, m)
 }
 
 // clientIP returns the client IP address from the request

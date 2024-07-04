@@ -4,7 +4,6 @@ import (
 	"crypto/x509"
 	_ "embed"
 	"encoding/pem"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -39,7 +38,6 @@ func TestMain(m *testing.M) {
 				return
 			}
 
-			fmt.Println(token)
 			if claims, ok := token.Claims.(IdentifiableClaims); ok && token.Valid {
 				_, _ = w.Write([]byte(claims.IdentifierValue()))
 				return
@@ -87,6 +85,31 @@ func TestProxy_Auth(t *testing.T) {
 	body, err := io.ReadAll(req.Body)
 	require.Nil(t, err)
 	require.Equal(t, "testuser", string(body))
+}
+
+func TestProxy_PreAuthMiddleware(t *testing.T) {
+	s := New[noopResult](":8080", testSigningKey, WithAuthenticator(NoopeAuthenticator{
+		authenticated: true,
+		identifier:    "testuser",
+	}))
+	s.AddRoute("*", fakeBackend.URL)
+	s.PreAuth(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+		})
+	})
+
+	handler := httptest.NewServer(s)
+	defer handler.Close()
+
+	res, err := http.Get(handler.URL + "/whoami")
+	require.Nil(t, err)
+
+	require.Equal(t, http.StatusTooManyRequests, res.StatusCode)
+	body, err := io.ReadAll(res.Body)
+	require.Nil(t, err)
+	require.Equal(t, "rate limited", string(body))
 }
 
 //go:embed rsatest.key
