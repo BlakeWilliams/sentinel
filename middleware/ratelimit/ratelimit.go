@@ -19,7 +19,7 @@ type RateLimiter struct {
 	KeyNamespace string
 }
 
-var luaScript = `local key = KEYS[1]
+var luaScript = redis.NewScript(`local key = KEYS[1]
 local window = tonumber(ARGV[1])
 local now = redis.call("TIME")
 local window_start = tonumber(now[1]) - window
@@ -35,7 +35,7 @@ if request_count < tonumber(max_requests) then
 end
 
 return 1
-`
+`)
 
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	if rl.KeyNamespace == "" {
@@ -48,9 +48,9 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			key = auth.IdentifierValue()
 		}
 
-		res := rl.redis.Eval(
+		res := luaScript.Run(
 			r.Context(),
-			luaScript,
+			rl.redis,
 			[]string{
 				fmt.Sprintf("%s:%s", rl.KeyNamespace, key),
 			},
