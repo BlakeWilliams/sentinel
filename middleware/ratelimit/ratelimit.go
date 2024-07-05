@@ -107,6 +107,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	}
 
 	breakerSettings.OnStateChange = func(name string, from gobreaker.State, to gobreaker.State) {
+		rl.Logger.Info("circuit breaker state change", "name", name, "from", from, "to", to)
 	}
 
 	breakerSettings.ReadyToTrip = func(counts gobreaker.Counts) bool {
