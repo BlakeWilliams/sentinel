@@ -2,6 +2,8 @@ package ratelimit
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,12 +13,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+var DefaultKeyNamespace = "sentinel:rate-limit"
+
 // RateLimiter is a middleware for rate limiting requests via Sentinel.
 type RateLimiter struct {
-	redis        *redis.Client
+	redis        redis.Cmdable
 	Window       time.Duration
 	MaxRequests  int
 	KeyNamespace string
+	Logger       *slog.Logger
 }
 
 var luaScript = redis.NewScript(`local key = KEYS[1]
@@ -39,7 +44,11 @@ return 1
 
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	if rl.KeyNamespace == "" {
-		rl.KeyNamespace = "ratelimiter:"
+		rl.KeyNamespace = DefaultKeyNamespace
+	}
+
+	if rl.Logger == nil {
+		rl.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,17 +69,21 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			},
 		)
 
+		// If there was an error running the script, log it and continue
+		// with the request. This fails closed so we don't disrupt access
+		// to the underlying backends.
 		if res.Err() != nil {
-			// TODO this isn't how a real gateway should handle errors
-			http.Error(w, res.Err().Error(), http.StatusInternalServerError)
-		}
-
-		if res.Val().(int64) == 1 {
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			rl.Logger.Error("error running rate limit script", "error", res.Err().Error())
+			next.ServeHTTP(w, r)
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		if res.Val().(int64) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 	})
 }
 
@@ -86,5 +99,7 @@ func clientIP(r *http.Request) string {
 		return ip
 	}
 
-	return r.RemoteAddr
+	ip := strings.Split(r.RemoteAddr, ":")[0]
+
+	return ip
 }

@@ -3,7 +3,7 @@ package radical_test
 import (
 	"testing"
 
-	"github.com/blakewilliams/sentinel/radical"
+	"github.com/blakewilliams/sentinel/internal/radical"
 	"github.com/stretchr/testify/require"
 )
 
