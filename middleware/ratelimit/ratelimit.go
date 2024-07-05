@@ -65,10 +65,8 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			http.Error(w, res.Err().Error(), http.StatusInternalServerError)
 		}
 
-		fmt.Println(res.Val())
 		if res.Val().(int64) == 1 {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
-			fmt.Println("LIMITED")
 			return
 		}
 
