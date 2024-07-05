@@ -4,6 +4,7 @@ import (
 	"crypto/x509"
 	_ "embed"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -195,6 +196,28 @@ func TestProxy_HopByHopHeaders(t *testing.T) {
 	require.Equal(t, http.StatusOK, res.StatusCode)
 	require.True(t, called)
 	require.Empty(t, res.Header.Get("Keep-Alive"))
+}
+
+func TestProxy_AuthErrorHeader(t *testing.T) {
+	called := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		require.NotEmpty(t, r.Header.Get("X-Sentinel-Error"))
+	}))
+	defer backend.Close()
+
+	s := New[noopResult](":8080", testSigningKey, WithAuthenticator(&NoopeAuthenticator{
+		authenticated: false,
+		error:         errors.New("oh snap"),
+	}))
+	s.AddRoute("*", backend.URL)
+	handler := httptest.NewServer(s)
+	defer handler.Close()
+
+	res, err := http.Get(handler.URL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	require.True(t, called)
 }
 
 //go:embed rsatest.key

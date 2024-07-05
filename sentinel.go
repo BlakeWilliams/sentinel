@@ -2,6 +2,7 @@ package sentinel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -124,6 +125,12 @@ func (s *Server[T]) compileInnerHandler() http.Handler {
 			req.Header.Set("X-Forwarded-Proto", req.Proto)
 		}
 
+		for k, values := range r.Header {
+			for _, v := range values {
+				req.Header.Add(k, v)
+			}
+		}
+
 		if auth, ok := GetAuth[T](r.Context()); ok {
 			// Set the JWT token in the header for the service to utilize
 			unsignedToken := jwt.NewWithClaims(jwt.SigningMethodRS256, auth)
@@ -171,18 +178,21 @@ func (s *Server[T]) CompileHandler() {
 
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.authenticator != nil {
-			isAuthed, payload, err := s.authenticator.Authenticate(w, r)
+			payload, err := s.authenticator.Authenticate(w, r)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				// TODO log when an error occurs here, but we should be resilient to failure unless configured otherwise
+				// in the meantime, we'll set a header to indicate an error occurred so downstream
+				// services can handle it appropriately. Maybe this should be part of the abstracted JWT?
+				if !errors.Is(err, NotAuthenticated) {
+					r.Header.Set("X-Sentinel-Error", "true")
+				}
+				innerHandler.ServeHTTP(w, r)
 				return
 			}
 
-			if isAuthed {
-				r = r.WithContext(context.WithValue(r.Context(), AuthContextKey{}, payload))
-			}
+			r = r.WithContext(context.WithValue(r.Context(), AuthContextKey{}, payload))
 		}
 
-		// this is where we call the inner handler
 		innerHandler.ServeHTTP(w, r)
 	})
 
