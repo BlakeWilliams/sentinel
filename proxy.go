@@ -179,21 +179,6 @@ func (s *Server[T]) PostAuth(m Middleware) {
 	s.postAuthMiddleware = append(s.postAuthMiddleware, m)
 }
 
-// clientIP returns the client IP address from the request
-// headers to be used in rate limiting.
-func clientIP(r *http.Request) string {
-	forwarded := r.Header.Get("X-Forwarded-For")
-	if forwarded != "" {
-		return strings.SplitN(forwarded, " ", 2)[0]
-	}
-
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-
-	return r.RemoteAddr
-}
-
 type AuthContextKey struct{}
 
 func GetAuth[T IdentifiableClaims](ctx context.Context) (T, bool) {
