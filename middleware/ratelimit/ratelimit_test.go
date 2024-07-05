@@ -1,8 +1,10 @@
 package ratelimit
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -21,7 +23,7 @@ func TestRateLimit(t *testing.T) {
 	defer redis.FlushAll(context.TODO())
 
 	rl := &RateLimiter{
-		redis:        redis,
+		Redis:        redis,
 		Window:       1 * time.Minute,
 		MaxRequests:  3,
 		KeyNamespace: "testratelimiter:v1",
@@ -63,7 +65,7 @@ func TestRateLimit_AuthenticatedUsesIdentifier(t *testing.T) {
 	defer redis.FlushAll(context.TODO())
 
 	rl := &RateLimiter{
-		redis:       redis,
+		Redis:       redis,
 		Window:      1 * time.Minute,
 		MaxRequests: 3,
 	}
@@ -85,27 +87,67 @@ func TestRateLimit_AuthenticatedUsesIdentifier(t *testing.T) {
 // RedisWithErrors is a mock redis client that returns errors on every call for
 // lua scripts to test the failure scenario
 type RedisWithErrors struct {
+	calls int
 	redis.Cmdable
 }
 
-func (r RedisWithErrors) EvalSha(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
+func (r *RedisWithErrors) EvalSha(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
+	r.calls += 1
 	return redis.NewCmdResult(nil, errors.New("oops"))
 }
 
 func TestRateLimit_DisconnectedRedis(t *testing.T) {
 	rl := &RateLimiter{
-		redis:        RedisWithErrors{},
+		Redis:        &RedisWithErrors{},
 		Window:       1 * time.Minute,
 		MaxRequests:  3,
 		KeyNamespace: "testratelimiter:v1",
 	}
 
 	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("hello world"))
+		_, _ = w.Write([]byte("hello world"))
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
 	require.Equal(t, http.StatusOK, res.Result().StatusCode)
+}
+
+func TestRateLimit_CircuitBreaker(t *testing.T) {
+	b := new(bytes.Buffer)
+	logger := slog.New(slog.NewJSONHandler(b, nil))
+	badRedis := &RedisWithErrors{}
+	rl := &RateLimiter{
+		Redis:        badRedis,
+		Window:       1 * time.Minute,
+		MaxRequests:  3,
+		KeyNamespace: "testratelimiter:v1",
+		Logger:       logger,
+		CircuitBreakerConfig: CircuitBreakerConfig{
+			MaxRequests: 1,
+			Interval:    time.Second * 5,
+			Timeout:     time.Second * 15,
+		},
+	}
+
+	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello world"))
+	}))
+
+	for i := 0; i < 6; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		require.Equal(t, http.StatusOK, res.Result().StatusCode)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	require.Equal(t, http.StatusOK, res.Result().StatusCode)
+	require.Equal(t, "hello world", res.Body.String())
+
+	require.Equal(t, 5, badRedis.calls)
+	require.Contains(t, b.String(), "circuit breaker is open")
 }
