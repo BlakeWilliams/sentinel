@@ -23,7 +23,6 @@ func TestMain(m *testing.M) {
 		}
 
 		if r.URL.Path == "/whoami" {
-
 			jwtHeader := r.Header.Get("X-Sentinel-Token")
 			if jwtHeader == "" {
 				_, _ = w.Write([]byte("no token"))
@@ -172,6 +171,30 @@ func TestProxy_PostAuthMiddleware_Unauthenticated(t *testing.T) {
 	require.Nil(t, err)
 	require.Equal(t, "no token", string(body))
 	require.True(t, called)
+}
+
+func TestProxy_HopByHopHeaders(t *testing.T) {
+	called := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		require.Empty(t, r.Header.Get("Connection"))
+		require.Empty(t, r.Header.Get("Upgrade"))
+		require.NotEmpty(t, r.Header.Get("X-Forwarded-For"))
+
+		w.Header().Set("Keep-Alive", "timeout=5, max=1000")
+	}))
+	defer backend.Close()
+
+	s := New[noopResult](":8080", testSigningKey)
+	s.AddRoute("*", backend.URL)
+	handler := httptest.NewServer(s)
+	defer handler.Close()
+
+	res, err := http.Get(handler.URL + "/whoami")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	require.True(t, called)
+	require.Empty(t, res.Header.Get("Keep-Alive"))
 }
 
 //go:embed rsatest.key

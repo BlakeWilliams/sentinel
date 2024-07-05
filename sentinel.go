@@ -11,6 +11,17 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+var hopByHop = map[string]struct{}{
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"TE":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+}
+
 type Route struct {
 	Pattern string
 	Backend string
@@ -94,6 +105,25 @@ func (s *Server[T]) compileInnerHandler() http.Handler {
 			return
 		}
 
+		for k := range hopByHop {
+			req.Header.Del(k)
+		}
+		if existingForwarded := r.Header.Get("X-Forwarded-For"); existingForwarded != "" {
+			req.Header.Set("X-Forwarded-For", existingForwarded+", "+r.RemoteAddr)
+		} else {
+			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
+		}
+
+		// go strips the host header for some reason, lets set it back
+		req.Header.Set("Host", req.Host)
+
+		if val := req.Header.Get("X-Forwarded-Host"); val == "" {
+			req.Header.Set("X-Forwarded-Host", req.Host)
+		}
+		if val := req.Header.Get("X-Forwarded-Proto"); val == "" {
+			req.Header.Set("X-Forwarded-Proto", req.Proto)
+		}
+
 		if auth, ok := GetAuth[T](r.Context()); ok {
 			// Set the JWT token in the header for the service to utilize
 			unsignedToken := jwt.NewWithClaims(jwt.SigningMethodRS256, auth)
@@ -117,7 +147,9 @@ func (s *Server[T]) compileInnerHandler() http.Handler {
 
 		for k, values := range res.Header {
 			for _, v := range values {
-				w.Header().Add(k, v)
+				if _, ok := hopByHop[k]; !ok {
+					w.Header().Add(k, v)
+				}
 			}
 		}
 
