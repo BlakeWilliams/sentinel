@@ -73,7 +73,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		// with the request. This fails closed so we don't disrupt access
 		// to the underlying backends.
 		if res.Err() != nil {
-			rl.Logger.Error("error running rate limit script", "error", res.Err().Error())
+			rl.Logger.Error("error running rate limit script", "error", res.Err().Error(), "identifier", key)
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -83,6 +83,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		rl.Logger.Error("rate limit exceeded", "identifier", key)
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 	})
 }
