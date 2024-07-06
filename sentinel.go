@@ -10,6 +10,11 @@ import (
 
 	"github.com/blakewilliams/sentinel/internal/radical"
 	"github.com/golang-jwt/jwt/v5"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 var hopByHop = map[string]struct{}{
@@ -38,10 +43,20 @@ func WithAuthenticator[T IdentifiableClaims](a Authenticator[T]) ServerOpt[T] {
 	}
 }
 
-// WithHTTPClient sets the http client for the server.
+// WithHTTPClient sets the http client for the server. By default it uses
+// otelhttp.DefaultClient. If overriding, consider using otelhttp.NewClient or
+// otherwise implementing tracing to ensure that tracing is emitted.
 func WithHTTPClient[T IdentifiableClaims](c *http.Client) ServerOpt[T] {
 	return func(s *Server[T]) {
 		s.httpClient = c
+	}
+}
+
+// WithTracer sets the OTEL tracer provider to be used by the server. By default it uses
+// the a no-op tracer with `sentinel“ as the tracer name.
+func WithTracerProvider[T IdentifiableClaims](t trace.TracerProvider) ServerOpt[T] {
+	return func(s *Server[T]) {
+		s.tracer = t.Tracer("sentinel")
 	}
 }
 
@@ -57,6 +72,7 @@ type Server[T IdentifiableClaims] struct {
 	authenticator      Authenticator[T]
 	once               sync.Once
 	handler            http.Handler
+	tracer             trace.Tracer
 	preAuthMiddleware  []Middleware
 	postAuthMiddleware []Middleware
 }
@@ -66,7 +82,8 @@ func New[T IdentifiableClaims](addr string, signingKey any, opts ...ServerOpt[T]
 		Addr:       addr,
 		Routes:     radical.New[Route](),
 		signingKey: signingKey,
-		httpClient: http.DefaultClient,
+		httpClient: otelhttp.DefaultClient,
+		tracer:     noop.NewTracerProvider().Tracer("sentinel"),
 	}
 
 	for _, opt := range opts {
@@ -97,8 +114,10 @@ func (s *Server[T]) compileInnerHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-
-		// TODO remove irrelevant headers
+		// Ensure we have a tracer and add the route to the context
+		labeler, _ := otelhttp.LabelerFromContext(r.Context())
+		labeler.Add(semconv.HTTPRoute(route.Pattern))
+		labeler.Add(attribute.String("http.target", route.Backend))
 
 		req, err := http.NewRequest(r.Method, route.Backend+r.URL.Path, r.Body)
 		if err != nil {
@@ -177,24 +196,34 @@ func (s *Server[T]) CompileHandler() {
 	innerHandler := s.compileInnerHandler()
 
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.authenticator != nil {
-			payload, err := s.authenticator.Authenticate(w, r)
-			if err != nil {
-				// TODO log when an error occurs here, but we should be resilient to failure unless configured otherwise
-				// in the meantime, we'll set a header to indicate an error occurred so downstream
-				// services can handle it appropriately. Maybe this should be part of the abstracted JWT?
-				if !errors.Is(err, NotAuthenticated) {
-					r.Header.Set("X-Sentinel-Error", "true")
+
+		{
+			ctx, span := s.tracer.Start(r.Context(), "sentinel.auth")
+			if s.authenticator != nil {
+				payload, err := s.authenticator.Authenticate(w, r.WithContext(ctx))
+				if err != nil {
+					// TODO log when an error occurs here, but we should be resilient to failure unless configured otherwise
+					// in the meantime, we'll set a header to indicate an error occurred so downstream
+					// services can handle it appropriately. Maybe this should be part of the abstracted JWT?
+					if !errors.Is(err, NotAuthenticated) {
+						r.Header.Set("X-Sentinel-Error", "true")
+					}
+					innerHandler.ServeHTTP(w, r)
+					span.End()
+
+					return
 				}
-				innerHandler.ServeHTTP(w, r)
-				return
+
+				r = r.WithContext(context.WithValue(r.Context(), AuthContextKey{}, payload))
 			}
 
-			r = r.WithContext(context.WithValue(r.Context(), AuthContextKey{}, payload))
+			span.End()
 		}
 
 		innerHandler.ServeHTTP(w, r)
 	})
+
+	handler = otelhttp.NewHandler(handler, "sentinel.serve")
 
 	for i := len(s.preAuthMiddleware) - 1; i >= 0; i-- {
 		existingHandler := handler
